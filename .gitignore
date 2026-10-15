@@ -1,0 +1,40 @@
+# LaTeX byproducts -- only .tex and .pdf are kept
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.synctex
+*.bbl
+*.blg
+*.bcf
+*.run.xml
+*.nav
+*.snm
+*.vrb
+*.lof
+*.lot
+*.loa
+*.thm
+*.idx
+*.ilg
+*.ind
+*.xdv
+*.dvi
+.build-*.log
+
+# Python / data
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.parquet
+*.h5
+
+# Editor / OS
+.DS_Store
+
+# scratch and secrets
+scratch/
+.env
