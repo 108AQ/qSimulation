@@ -259,33 +259,58 @@ class StatevectorBackend:
 
 
 class QnexusBackend:
-    """Quantinuum Nexus submission path (emulators and hardware). Written against the qnexus API; untested here.
-    Install: pip install qnexus ; authenticate once with `qnx.login()` (browser) in the same environment."""
+    """Quantinuum Nexus submission path (emulators and hardware). Written against the qnexus API as documented on
+    docs.quantinuum.com (checked 2026-10-15: projects.get_or_create, circuits.upload, start_compile_job,
+    start_execute_job, jobs.wait_for, jobs.results, download_result().get_counts(), circuits.cost); NOT executed
+    from this server (no credentials). Install `pip install qnexus`; authenticate once with `qnx.login()`.
+    Device names (H-series): hardware H2-1, H2-2; HQC-charged noisy emulators H2-1E, H2-2E; Nexus-hosted
+    time-charged emulators H2-Emulator (noisy, <=26 qubits) and H2-1LE (noiseless); free syntax checkers
+    H2-1SC, H2-2SC. Helios (Helios-1 / Helios-1E) uses qnx.models.HeliosConfig and needs max_cost per job;
+    pytket circuits are accepted there but the native path is Guppy/HUGR. pytket-quantinuum no longer submits
+    jobs (removed in 0.56, Dec 2025)."""
     name = "qnexus"
 
-    def __init__(self, device="H2-1E", project="quantinuum-aq-benchmark", noisy=True):
+    def __init__(self, device="H2-1E", project="quantinuum-aq-benchmark", noisy=True, optimisation_level=2,
+                 max_cost=None):
         import qnexus as qnx                                     # lazy import: optional dependency
         self.qnx = qnx
         self.project = qnx.projects.get_or_create(name=project)
         self.config = qnx.QuantinuumConfig(device_name=device, noisy_simulation=noisy)
-        self.device = device
+        self.device, self.opt, self.max_cost = device, optimisation_level, max_cost
+        self.log = []                                            # (name, shots, HQC estimate) per submitted circuit
 
-    def counts(self, c: Circuit, measured, shots):
-        qnx = self.qnx
+    def _with_measures(self, c: Circuit, measured):
         c = c.copy()
         bits = c.add_c_register("c", len(measured))
         for b, q in zip(bits, measured):
             c.Measure(Qubit(q), b)
-        ref = qnx.circuits.upload(circuit=c, name=f"{self.device}-{int(time.time())}", project=self.project)
-        comp = qnx.start_compile_job(programs=[ref], backend_config=self.config, optimisation_level=2,
-                                     name="compile", project=self.project)
+        return c
+
+    def estimate_hqc(self, c: Circuit, measured, shots):
+        """Server-side HQC estimate (runs a costing job on Quantinuum's cost-estimation device)."""
+        ref = self.qnx.circuits.upload(circuit=self._with_measures(c, measured), name=f"cost-{int(time.time())}", project=self.project)
+        return self.qnx.circuits.cost(ref, n_shots=shots, backend_config=self.config, project=self.project)
+
+    def counts(self, c: Circuit, measured, shots):
+        qnx = self.qnx
+        if shots is None:
+            raise ValueError("the Nexus backend needs a shot count")
+        name = f"{self.device}-{int(time.time())}"
+        ref = qnx.circuits.upload(circuit=self._with_measures(c, measured), name=name, project=self.project)
+        comp = qnx.start_compile_job(programs=[ref], backend_config=self.config, optimisation_level=self.opt,
+                                     name=f"compile-{name}", project=self.project, skip_intermediate_circuits=False)
         qnx.jobs.wait_for(comp)
-        compiled = qnx.jobs.results(comp)[0].get_output()
-        job = qnx.start_execute_job(programs=[compiled], n_shots=[shots], backend_config=self.config,
-                                    name="execute", project=self.project)
+        compiled = [item.get_output() for item in qnx.jobs.results(comp)]
+        kw = dict(programs=compiled, n_shots=[shots] * len(compiled), backend_config=self.config,
+                  name=f"execute-{name}", project=self.project)
+        if self.max_cost is not None:
+            kw["max_cost"] = [self.max_cost] * len(compiled)     # mandatory on Helios, advisable on H2
+        job = qnx.start_execute_job(**kw)
         qnx.jobs.wait_for(job)
-        result = qnx.jobs.results(job)[0].download_result()
-        return {"".join(str(b) for b in k): int(v) for k, v in result.get_counts().items()}
+        result = qnx.jobs.results(job)[0].download_result()        # pytket BackendResult
+        counts = result.get_counts()                               # keys: tuples of bits in register order
+        self.log.append((name, shots, None))
+        return {"".join(str(b) for b in k): int(v) for k, v in counts.items()}
 
 
 # ----------------------------------------------------------------------------------------------- measurement helpers
@@ -407,10 +432,24 @@ def toeplitz(x):
     return np.array([[x[k - j] if k >= j else np.conj(x[j - k]) for k in range(K)] for j in range(K)])
 
 
-def arm_krylov(s, h, cutoff=1e-2):
+def krylov_threshold(policy, K, shots, cutoff):
+    """Threshold on the eigenvalues of S (which has unit diagonal, so eigenvalues sum to K).
+    'relative': keep eigenvalues > cutoff * max (the policy of Check B);
+    'oliveira': absolute threshold 2 sqrt(K ln 2K) x (noise level per matrix element), the rule that worked best
+                under sampling noise in Oliveira, Ziems, Glaser, arXiv:2604.11532 (2026); noise level = 1/sqrt(shots)."""
+    if shots is None:
+        return ("relative", 1e-10)
+    if policy == "oliveira":
+        return ("absolute", 2 * math.sqrt(K * math.log(2 * K)) / math.sqrt(shots))
+    return ("relative", cutoff)
+
+
+def arm_krylov(s, h, cutoff=1e-2, policy="relative", shots=None):
     S, Hm = toeplitz(s), toeplitz(h)
     S, Hm = (S + S.conj().T) / 2, (Hm + Hm.conj().T) / 2
-    ev, evec = np.linalg.eigh(S); keep = ev > cutoff * ev.max()
+    ev, evec = np.linalg.eigh(S)
+    kind, thr = krylov_threshold(policy, len(s), shots, cutoff)
+    keep = ev > (thr * ev.max() if kind == "relative" else thr)
     if keep.sum() == 0:
         return np.nan, 0
     T = evec[:, keep] / np.sqrt(ev[keep])
@@ -446,75 +485,76 @@ def qite_pool(inst: Instance):
 
 
 def arm_qite(inst, H, backend, shots, dtau, nsteps, ridge, seed_rng):
-    """Per-term QITE (Motta et al.) with Pauli expectations measured from circuits. Returns trajectory, cost per step."""
+    """QITE with one fit per imaginary-time step for the whole Hamiltonian (the 'linear system' of the QITE
+    guide): S_{mu nu} = Re<sigma_mu sigma_nu>, b_mu = Im<sigma_mu (H - E)> = sum_l alpha_l Im<sigma_mu P_l>, solve
+    (S + ridge) a = b, append exp(-i dtau sum_mu a_mu sigma_mu) as Pauli rotations. All expectation values of a step
+    come from one measurement round (qubit-wise-commuting bases) on the current circuit; the energy of the
+    step is read from the same round. Returns the energy trajectory, the HQC per step and the two-qubit count."""
     n = inst.n_qubits; pool = qite_pool(inst); terms = inst.pauli_terms()
-    base = hf_circuit(inst)                                   # grows by one Pauli rotation per pool element per term
+    base = hf_circuit(inst)                                   # grows by up to |pool| Pauli rotations per step
     energies, costs, counts2q = [], [], []
-    # strings needed for S (products) and b (products with the term), grouped once
-    prod_cache = {}
-    def product(a, b):
-        if (a, b) not in prod_cache:
-            prod_cache[(a, b)] = pauli_product(a, b)
-        return prod_cache[(a, b)]
-    def measure_expectations(circ, strings):
-        """Expectation values of a set of Pauli strings on the state prepared by circ (statevector or sampled)."""
-        groups = qwc_groups([s for s in strings if set(s) != {"I"}])
+    prod = {}
+    for a in pool:
+        for b in pool:
+            prod[(a, b)] = pauli_product(a, b)
+        for t, _ in terms:
+            prod[(a, t)] = pauli_product(a, t)
+    needed = {s for _, s in prod.values()} | {t for t, _ in terms}
+
+    def measure_round(circ):
+        """Expectation values of all needed Pauli strings on the state prepared by circ (exact or sampled)."""
+        groups = qwc_groups([s for s in needed if set(s) != {"I"}])
         vals = {"I" * n: 1.0}; cost = 0.0
         for basis, members in groups:
             mc = compile_native(measurement_basis_circuit(circ, basis))
-            cnt = gate_counts(mc, n)
             counts = backend.counts(mc, list(range(n)), shots)
-            cost += hqc(cnt, shots if shots else 1)
+            cost += hqc(gate_counts(mc, n), shots if shots else 1)
             for s in members:
                 vals[s] = expectation_from_counts(counts, [i for i, ch in enumerate(s) if ch != "I"])
         return vals, cost
-    def energy(circ):
-        vals, cost = measure_expectations(circ, [t for t, _ in terms])
-        return inst.constant + sum(c * vals[t] for t, c in terms), cost
-    e, cost = energy(base); energies.append(e); costs.append(cost); counts2q.append(gate_counts(compile_native(base), n)["n2q"])
+
+    def energy_from(vals):
+        return inst.constant + sum(c * vals[t] for t, c in terms)
+
+    vals, cost = measure_round(base)
+    energies.append(energy_from(vals)); costs.append(cost); counts2q.append(gate_counts(compile_native(base), n)["n2q"])
     for step in range(nsteps):
-        step_cost = 0.0
-        for t, alpha in terms:
-            needed = set()
-            for a in pool:
-                for b in pool:
-                    needed.add(product(a, b)[1])
-                needed.add(product(a, t)[1])
-            needed.add(t)
-            vals, cost = measure_expectations(base, needed); step_cost += cost
-            # S_{mu nu} = Re <sigma_mu sigma_nu>, b_mu = sinh(dtau alpha)/(dtau sqrt(c)) Im <sigma_mu P>
-            S = np.zeros((len(pool), len(pool)))
-            for i, a in enumerate(pool):
-                for j, b in enumerate(pool):
-                    ph, s = product(a, b); S[i, j] = np.real(ph * vals[s])
-            c_norm = math.cosh(2 * dtau * alpha) - math.sinh(2 * dtau * alpha) * vals[t]
-            bvec = np.zeros(len(pool))
-            for i, a in enumerate(pool):
-                ph, s = product(a, t); bvec[i] = math.sinh(dtau * alpha) / (dtau * math.sqrt(max(c_norm, 1e-12))) * np.imag(ph * vals[s])
-            avec = np.linalg.solve(S + ridge * np.eye(len(pool)), bvec)
-            for a_coeff, pstr in zip(avec, pool):
-                if abs(a_coeff) > 1e-10:
-                    add_pauli_rotation(base, pstr, dtau * a_coeff, list(range(n)))
-        e, cost = energy(base); step_cost += cost
-        energies.append(e); costs.append(step_cost); counts2q.append(gate_counts(compile_native(base), n)["n2q"])
+        S = np.zeros((len(pool), len(pool))); bvec = np.zeros(len(pool))
+        for i, a in enumerate(pool):
+            for j, b in enumerate(pool):
+                ph, s = prod[(a, b)]; S[i, j] = np.real(ph * vals[s])
+            for t, alpha in terms:
+                ph, s = prod[(a, t)]; bvec[i] += alpha * np.imag(ph * vals[s])
+        avec = np.linalg.solve(S + ridge * np.eye(len(pool)), bvec)
+        for a_coeff, pstr in zip(avec, pool):
+            if abs(a_coeff) > 1e-10:
+                add_pauli_rotation(base, pstr, dtau * a_coeff, list(range(n)))
+        vals, cost = measure_round(base)
+        energies.append(energy_from(vals)); costs.append(cost); counts2q.append(gate_counts(compile_native(base), n)["n2q"])
     return np.array(energies), np.array(costs), counts2q
 
 
 # ----------------------------------------------------------------------------------------------- experiment
-def build_circuits(inst, K, dt, steps, K_spe=None, order=2):
+def n_steps(t, trotter_dt):
+    """Trotter steps for evolution time t at a fixed Trotter time step (cost grows linearly with t)."""
+    return max(1, int(math.ceil(abs(t) / trotter_dt - 1e-9)))
+
+
+def build_circuits(inst, K, dt, trotter_dt, K_spe=None, order=2):
     """Compile all circuits once. Returns sampling circuits (K time points), Hadamard-test circuits for the
     Krylov arm (m = 1..K-1, every measurement basis, Re and Im) and the Z-basis-only Hadamard tests for the
-    statistical-PE arm on its own, longer grid (m = 1..K_spe-1; the first K-1 are shared with Krylov)."""
+    statistical-PE arm on its own, longer grid (m = 1..K_spe-1; the first K-1 are shared with Krylov).
+    Every circuit for time t uses ceil(t / trotter_dt) Trotter steps of the given order."""
     n = inst.n_qubits; K_spe = K_spe or K
     samp = []
     for k in range(K):
-        c = compile_native(sampling_circuit(inst, k * dt, steps, order)); samp.append((c, gate_counts(c, n)))
+        c = compile_native(sampling_circuit(inst, k * dt, n_steps(k * dt, trotter_dt), order)); samp.append((c, gate_counts(c, n)))
     groups = qwc_groups([t for t, _ in inst.pauli_terms()])
     ht = {}
     for m in range(1, K):
         for basis, _ in groups:
             for imag in (False, True):
-                c = compile_native(hadamard_test_circuit(inst, m, dt, steps, basis, imag, order))
+                c = compile_native(hadamard_test_circuit(inst, m, dt, n_steps(m * dt, trotter_dt), basis, imag, order))
                 ht[(m, basis, imag)] = (c, gate_counts(c, n + 1))
     spe = {}
     for m in range(1, K_spe):
@@ -523,7 +563,7 @@ def build_circuits(inst, K, dt, steps, K_spe=None, order=2):
             if key in ht:
                 spe[(m, imag)] = ht[key]
             else:
-                c = compile_native(hadamard_test_circuit(inst, m, dt, steps, groups[0][0], imag, order))
+                c = compile_native(hadamard_test_circuit(inst, m, dt, n_steps(m * dt, trotter_dt), groups[0][0], imag, order))
                 spe[(m, imag)] = (c, gate_counts(c, n + 1))
     return samp, ht, spe, groups
 
@@ -551,24 +591,25 @@ def main():
     ap.add_argument("--shots", type=int, nargs="*", default=[100, 300, 1000, 3000, 10000])
     ap.add_argument("--K", type=int, default=None, help="number of Krylov time points (default per instance)")
     ap.add_argument("--K-spe", type=int, default=None, help="time points for the statistical-PE arm on its own grid (default 2K)")
-    ap.add_argument("--dt", type=float, default=None)
-    ap.add_argument("--trotter", type=int, default=None, help="Trotter steps per circuit")
+    ap.add_argument("--dt", type=float, default=None, help="Krylov/SPE time grid spacing")
+    ap.add_argument("--trotter-dt", type=float, default=None, help="Trotter time step (steps = ceil(t / trotter_dt))")
     ap.add_argument("--trotter-order", type=int, default=2, choices=[1, 2])
-    ap.add_argument("--cutoff", type=float, default=1e-3)
+    ap.add_argument("--threshold-policy", default="oliveira", choices=["oliveira", "relative"])
+    ap.add_argument("--cutoff", type=float, default=1e-3, help="relative cutoff when --threshold-policy relative")
     ap.add_argument("--qite-steps", type=int, default=8)
     ap.add_argument("--qite-dtau", type=float, default=0.2)
     ap.add_argument("--qite-ridge", type=float, default=0.1)
     args = ap.parse_args()
 
     inst = INSTANCES[args.instance]()
-    defaults = {"h2-2q": dict(K=6, dt=0.5, trotter=2), "h2-4q": dict(K=6, dt=0.5, trotter=2)}[args.instance]
-    K = args.K or defaults["K"]; dt = args.dt or defaults["dt"]; steps = args.trotter or defaults["trotter"]
-    K_spe = args.K_spe or 2 * K; order = args.trotter_order
+    defaults = {"h2-2q": dict(K=4, dt=0.5, trotter_dt=0.25), "h2-4q": dict(K=4, dt=0.5, trotter_dt=0.25)}[args.instance]
+    K = args.K or defaults["K"]; dt = args.dt or defaults["dt"]; trotter_dt = args.trotter_dt or defaults["trotter_dt"]
+    K_spe = args.K_spe or 3 * K; order = args.trotter_order; policy = args.threshold_policy
     H = inst.matrix(); w, V = np.linalg.eigh(H); E_fci = float(w[0])
     hf_index = int(inst.hf_bits, 2); E_hf = float(H[hf_index, hf_index].real)
     overlap = float(abs(V[hf_index, 0]) ** 2)
     print(f"{inst.name}: E_FCI = {E_fci:.6f}  E_HF = {E_hf:.6f}  |<HF|E0>|^2 = {overlap:.4f}  K={K} K_spe={K_spe} dt={dt} "
-          f"trotter={steps} (order {order})")
+          f"trotter_dt={trotter_dt} (order {order}), threshold policy {policy}")
     window = (E_hf - inst.constant - 0.5, E_hf - inst.constant + 0.1)      # QCELS search window from HF, not from the answer
 
     rng = np.random.default_rng(2026)
@@ -576,7 +617,7 @@ def main():
 
     # sanity: Trotter circuit vs exact propagator; Hadamard-test sign conventions (exact expectations)
     t0 = time.time()
-    samp, ht, spe, groups = build_circuits(inst, K, dt, steps, K_spe, order)
+    samp, ht, spe, groups = build_circuits(inst, K, dt, trotter_dt, K_spe, order)
     n_extra = sum(1 for k in spe if k[0] >= K)
     print(f"built and compiled {len(samp)} sampling + {len(ht)} Hadamard-test + {n_extra} extra SPE circuits in "
           f"{time.time()-t0:.1f}s; measurement bases per time point: {[g[0] for g in groups]}")
@@ -588,7 +629,8 @@ def main():
     s_long, _ = survival_data(inst, exact_backend, spe, None)
     trotter_err = float(np.max(np.abs(s_long - s_ex)))
     print(f"max |s_trotter - s_exact| over the SPE grid = {trotter_err:.2e} (Trotter + sign-convention check)")
-    e_kr_exact, rank = arm_krylov(s_m, h_m, args.cutoff)
+    e_kr_exact, rank = arm_krylov(s_m, h_m, args.cutoff, policy, None)
+    policies = {"krylov_oliveira": ("oliveira", None), "krylov_rel1e-3": ("relative", 1e-3), "krylov_rel1e-2": ("relative", 1e-2)}
     e_spe_exact, e_mp_exact = arm_spe(s_m, dt, window)
     e_spe_long_exact, _ = arm_spe(s_long, dt, window)
     print(f"noiseless (shots=None): Krylov {e_kr_exact + inst.constant - E_fci:+.2e} Ha (rank {rank}), "
@@ -606,7 +648,7 @@ def main():
               "spe_extra": [dict(m=m, imag=im, **cnt, hqc_1000=hqc(cnt, 1000)) for (m, im), (c, cnt) in spe.items() if m >= K]}
 
     results = dict(instance=inst.name, note=inst.note, E_FCI=E_fci, E_HF=E_hf, overlap_HF=overlap, K=K, K_spe=K_spe, dt=dt,
-                   trotter_steps=steps, trotter_order=order, cutoff=args.cutoff, trotter_check=trotter_err,
+                   trotter_dt=trotter_dt, trotter_order=order, threshold_policy=policy, cutoff=args.cutoff, trotter_check=trotter_err,
                    qcels_window=window, backend=backend.name,
                    classical_control=dict(dim=len(idx_shell), err=e_shell - E_fci),
                    noiseless=dict(krylov=e_kr_exact + inst.constant - E_fci, krylov_rank=rank,
@@ -616,12 +658,13 @@ def main():
 
     # budget sweep (shots per circuit); every seed re-samples all circuits
     for shots in args.shots:
-        rows = {"skqd": [], "skqd_noshell": [], "krylov": [], "spe_qcels_same": [], "spe_pencil_same": [], "spe_qcels": []}
+        rows = {"skqd": [], "skqd_noshell": [], **{k: [] for k in policies}, "spe_qcels_same": [], "spe_pencil_same": [], "spe_qcels": []}
         for seed in range(args.seeds):
             e, dim, cost = arm_skqd(inst, H, backend, samp, shots, shell=True); rows["skqd"].append((e - E_fci, cost, dim))
             e, dim, cost = arm_skqd(inst, H, backend, samp, shots, shell=False); rows["skqd_noshell"].append((e - E_fci, cost, dim))
             s, h, cost, cost_s = hadamard_data(inst, backend, ht, shots)
-            e, rank = arm_krylov(s, h, args.cutoff); rows["krylov"].append((e + inst.constant - E_fci, cost, rank))
+            for key, (pol, cut) in policies.items():
+                e, rank = arm_krylov(s, h, cut if cut else args.cutoff, pol, shots); rows[key].append((e + inst.constant - E_fci, cost, rank))
             eq, emp = arm_spe(s, dt, window)
             rows["spe_qcels_same"].append((eq + inst.constant - E_fci, cost_s, K)); rows["spe_pencil_same"].append((emp + inst.constant - E_fci, cost_s, K))
             s2, cost2 = survival_data(inst, backend, spe, shots)
@@ -664,7 +707,9 @@ def plot(results, inst):
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     plt.rcParams.update({"font.size": 9, "axes.spines.top": False, "axes.spines.right": False})
     fig, ax = plt.subplots(1, 2, figsize=(9, 3.4))
-    style = {"skqd": ("#2a78d6", "o-", "SKQD (sample + 1 shell)"), "krylov": ("#eb6834", "s-", f"coherent Krylov (K={results['K']})"),
+    style = {"skqd": ("#2a78d6", "o-", "SKQD (sample + 1 shell)"),
+             "krylov_oliveira": ("#eb6834", "s-", f"coherent Krylov (K={results['K']}), noise-aware threshold"),
+             "krylov_rel1e-3": ("#eb6834", "s:", "coherent Krylov, relative cutoff 1e-3"),
              "spe_qcels_same": ("#1baf7a", "v:", "statistical PE, QCELS on the Krylov data"),
              "spe_qcels": ("#1baf7a", "^-", f"statistical PE, QCELS, own grid (K={results['K_spe']}, Z-basis only)")}
     for arm, (col, mk, lab) in style.items():
